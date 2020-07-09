@@ -78,8 +78,9 @@ def add_host_list(host_list):
                     input_host = deserialize_host_http(host)
                     (output_host, add_result) = _add_host(input_host)
                     status_code = _convert_host_results_to_http_status(add_result)
-                    response_host_list.append({"status": status_code, "host": output_host})
-                    payload_tracker_processing_ctx.inventory_id = output_host["id"]
+                    serialized_host = serialize_host(output_host, staleness_timestamps())
+                    response_host_list.append({"status": status_code, "host": serialized_host})
+                    payload_tracker_processing_ctx.inventory_id = output_host.id
 
                     reporter = host.get("reporter")
             except ValidationException as e:
@@ -124,7 +125,7 @@ def _add_host(input_host):
             "host",
         )
 
-    return add_host(input_host, staleness_timestamps(), update_system_profile=False)
+    return add_host(input_host, update_system_profile=False)
 
 
 def get_bulk_query_source():
@@ -252,7 +253,8 @@ def get_host_system_profile_by_id(host_id_list, page=1, per_page=100, order_by=N
 
 def _emit_patch_event(host):
     key = host["id"]
-    headers = message_headers(EventType.updated)
+    registered_with_insights = "true" if "insights_id" in host else "false"
+    headers = message_headers(EventType.updated, registered_with_insights)
     event = build_event(EventType.updated, host)
     current_app.event_producer.write_event(event, key, headers, Topic.events)
 

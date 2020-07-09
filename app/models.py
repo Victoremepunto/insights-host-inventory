@@ -230,6 +230,9 @@ class Host(db.Model):
             # Update the fields that were passed in
             self.system_profile_facts = {**self.system_profile_facts, **input_system_profile}
         orm.attributes.flag_modified(self, "system_profile_facts")
+    
+    def registered_with_insights(self):
+        return "insights_id" in self.canonical_facts
 
     def __repr__(self):
         return (

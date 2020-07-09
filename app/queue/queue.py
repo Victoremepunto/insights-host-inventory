@@ -10,6 +10,7 @@ from app.culling import Timestamps
 from app.exceptions import InventoryException
 from app.logging import get_logger
 from app.logging import threadctx
+from app.models import db
 from app.payload_tracker import get_payload_tracker
 from app.payload_tracker import PayloadTrackerContext
 from app.payload_tracker import PayloadTrackerProcessingContext
@@ -20,7 +21,9 @@ from app.queue.events import build_event
 from app.queue.events import message_headers
 from app.serialization import DEFAULT_FIELDS
 from app.serialization import deserialize_host_mq
+from app.serialization import serialize_host
 from lib import host_repository
+from lib.db import session_guard
 
 logger = get_logger(__name__)
 
@@ -99,7 +102,6 @@ def add_host(host_data):
 
         try:
             input_host = deserialize_host_mq(host_data)
-            staleness_timestamps = Timestamps.from_config(inventory_config())
             logger.info(
                 "Attempting to add host",
                 extra={
@@ -113,19 +115,12 @@ def add_host(host_data):
                     }
                 },
             )
-            (output_host, add_result) = host_repository.add_host(
-                input_host, staleness_timestamps, fields=EGRESS_HOST_FIELDS
-            )
+            (output_host, add_result) = host_repository.add_host(input_host)
             metrics.add_host_success.labels(
                 add_result.name, host_data.get("reporter", "null")
             ).inc()  # created vs updated
             # log all the incoming host data except facts and system_profile b/c they can be quite large
-            logger.info(
-                "Host %s",
-                add_result.name,
-                extra={"host": {i: output_host[i] for i in output_host if i not in ("facts", "system_profile")}},
-            )
-            payload_tracker_processing_ctx.inventory_id = output_host["id"]
+            payload_tracker_processing_ctx.inventory_id = output_host.id
             return (output_host, add_result)
         except InventoryException:
             logger.exception("Error adding host ", extra={"host": host_data})
@@ -148,14 +143,27 @@ def handle_message(message, event_producer):
     payload_tracker = get_payload_tracker(request_id=request_id)
 
     with PayloadTrackerContext(payload_tracker, received_status_message="message received"):
-        (output_host, add_results) = add_host(validated_operation_msg["data"])
-        event_type = add_host_results_to_event_type(add_results)
-        event = build_event(event_type, output_host, platform_metadata=platform_metadata)
-        event_producer.write_event(event, output_host["id"], message_headers(add_results), Topic.egress)
+        with session_guard(db.session):
+            (output_host, add_results) = add_host(validated_operation_msg["data"])
+            staleness_timestamps = Timestamps.from_config(inventory_config())
+            serialized_host = serialize_host(output_host, staleness_timestamps, EGRESS_HOST_FIELDS)
 
-        # for transition to platform.inventory.events
-        if inventory_config().secondary_topic_enabled:
-            event_producer.write_event(event, output_host["id"], message_headers(add_results), Topic.events)
+            logger.info(
+                "Host %s",
+                add_results.name,
+                extra={
+                    "host": {i: serialized_host[i] for i in serialized_host if i not in ("facts", "system_profile")}
+                },
+            )
+
+            event_type = add_host_results_to_event_type(add_results)
+            headers = message_headers(event_type, output_host.registered_with_insights())
+            event = build_event(event_type, output_host, platform_metadata=platform_metadata)
+            event_producer.write_event(event, serialized_host["id"], headers, Topic.egress)
+
+            # for transition to platform.inventory.events
+            if inventory_config().secondary_topic_enabled:
+                event_producer.write_event(event, serialized_host["id"], headers, Topic.events)
 
 
 def event_loop(consumer, flask_app, event_producer, handler, shutdown_handler):
